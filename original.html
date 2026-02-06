@@ -15739,11 +15739,16 @@ window.PERF_MONITOR = {
             const step = low ? 24 : 12;
             const layers = low ? PARALLAX_LAYERS.slice(0, 3) : PARALLAX_LAYERS;
 
-            // 与天空同一套分桶，保持一致的昼夜气氛
-            const bucket = (typeof renderer._getSkyBucket === 'function')
-                ? renderer._getSkyBucket(time)
-                : (time < 0.2 ? 0 : time < 0.3 ? 1 : time < 0.7 ? 2 : time < 0.8 ? 3 : 0);
-            const theme = (bucket === 0) ? 'night' : (bucket === 1) ? 'dawn' : (bucket === 2) ? 'day' : 'dusk';
+            // ── Mountain Rendering Patch v2: deterministic theme derivation ──
+            // Always derive the theme directly from the time value, never from
+            // renderer._getSkyBucket which has multiple conflicting implementations
+            // (class returns t*100, patch returns 0-3). This guarantees theme
+            // is always correct regardless of which _getSkyBucket is active.
+            const theme = (time < 0.2) ? 'night'
+                        : (time < 0.3) ? 'dawn'
+                        : (time < 0.7) ? 'day'
+                        : (time < 0.8) ? 'dusk'
+                        : 'night';
 
             // ───────────────────────── Cache（按主题/分辨率/低功耗重建） ─────────────────────────
             const cacheKey = theme + '|' + h + '|' + (low ? 1 : 0) + '|' + step + '|' + layers.length;
@@ -16192,27 +16197,11 @@ window.PERF_MONITOR = {
                     ctx.beginPath(); ctx.arc(cx + 8, cy + 6, 4, 0, Math.PI * 2); ctx.fill();
                 }
 
-                // --- TU Mount Fix Logic ---
-                // Avoid double-drawing when we're painting into the background cache
-                if (this._bgCacheDrawing) return;
-
-                try {
-                    const gs = window.GAME_SETTINGS || {};
-                    const mountainsEnabled = (gs.bgMountains !== false) && (gs.__bgMountainsEffective !== false);
-                    if (!mountainsEnabled) return;
-
-                    // Only needed when reduced-motion is enabled; in normal mode the main loop draws parallax separately.
-                    if (!gs.reducedMotion) return;
-
-                    // Respect low-power throttling.
-                    if (this.lowPower) return;
-
-                    // Draw static mountains.
-                    // Note: we need to access the global renderParallaxMountains if available, or if made into a method
-                    if (typeof renderParallaxMountains === 'function') {
-                        renderParallaxMountains(this, { x: 0, y: (cam && cam.y) || 0 }, time);
-                    }
-                } catch (e) { if (typeof console !== 'undefined' && console.debug) console.debug('[Debug] Silently caught:', e); }
+                // --- TU Mount Fix Logic (DISABLED) ---
+                // Mountains are now drawn from a single authoritative call site in
+                // Game.prototype.render (see "Mountain Rendering Patch v2" below).
+                // Drawing them inside renderSky caused double-draws, cache
+                // interference, and desync with the sky/lighting system.
             }
 
             renderParallax(cam, time = 0.5) {
@@ -16522,11 +16511,15 @@ window.PERF_MONITOR = {
             // --- Helper Methods (Consolidated from patches) ---
 
             renderBackgroundCached(cam, time, drawParallax = true) {
+                // ── Mountain Rendering Patch v2 ──
+                // This method now ONLY caches the sky gradient + celestial bodies.
+                // Mountains are drawn exclusively by Game.prototype.render after
+                // this method returns, eliminating double-draw and cache-desync bugs.
                 this._ensureBgCache();
                 const bg = this._bgCache;
                 if (!bg || !bg.canvas || !bg.ctx) {
                     this.renderSky(cam, time);
-                    if (drawParallax) this.renderParallax(cam, time);
+                    // Mountains intentionally NOT drawn here; Game.render handles them.
                     return;
                 }
 
@@ -16534,12 +16527,6 @@ window.PERF_MONITOR = {
 
                 const now = performance.now();
                 const dt = now - (bg.lastAt || 0);
-                const gs = window.GAME_SETTINGS || {};
-                const mountainsEnabled = (gs.bgMountains !== false) && (gs.__bgMountainsEffective !== false);
-                const reducedMotion = !!gs.reducedMotion;
-
-                // Allow mountains even when reduced-motion caused the caller to disable drawParallax
-                const parOn = (!!drawParallax) || (reducedMotion && mountainsEnabled && !this.lowPower);
                 const refreshInterval = this.lowPower ? 4600 : 750;
                 const t = (typeof time === 'number' && isFinite(time)) ? time : (bg.lastTime || 0);
 
@@ -16573,7 +16560,7 @@ window.PERF_MONITOR = {
                 }
 
                 this.ctx.drawImage(bg.canvas, 0, 0, this.w, this.h);
-                if (parOn) this.renderParallax(cam, t);
+                // Mountains intentionally NOT drawn here; Game.render handles them.
             }
 
             _ensureBgCache() {
@@ -20032,15 +20019,20 @@ window.PERF_MONITOR = {
                 const cam = this._renderCamera || this.camera;
                 this.renderer.clear();
                 if (this.renderer.renderBackgroundCached) {
-                    this.renderer.renderBackgroundCached(
-                        cam,
-                        this.timeOfDay,
-                        !this.settings.reducedMotion && this._perf.level !== 'low'
-                    );
+                    this.renderer.renderBackgroundCached(cam, this.timeOfDay, false);
                 } else {
                     this.renderer.renderSky(cam, this.timeOfDay);
-                    if (!this.settings.reducedMotion && this._perf.level !== 'low') this.renderer.renderParallax(cam, this.timeOfDay);
                 }
+
+                // ── Mountain Rendering Patch v2 (original render fallback) ──
+                {
+                    const gs = window.GAME_SETTINGS || this.settings || {};
+                    const mtEnabled = (gs.bgMountains !== false) && (gs.__bgMountainsEffective !== false);
+                    if (mtEnabled && typeof renderParallaxMountains === 'function') {
+                        renderParallaxMountains(this.renderer, cam, this.timeOfDay);
+                    }
+                }
+
                 this.renderer.renderWorld(this.world, cam, this.timeOfDay);
 
                 // 渲染掉落物
@@ -20784,7 +20776,22 @@ window.PERF_MONITOR = {
 
                                                         renderer.clear();
                                                         renderer.renderSky(cam, this.timeOfDay);
-                                                        if (!settings.reducedMotion && this._perf && this._perf.level !== 'low') renderer.renderParallax(cam, this.timeOfDay);
+
+                                                        // ── Mountain Rendering Patch v2 ──
+                                                        // Single authoritative call site for mountains.
+                                                        // Respects the user bgMountains toggle and autoQuality
+                                                        // effective flag, but no longer skipped by
+                                                        // reducedMotion / low-perf — those only affected the
+                                                        // old parallax *scrolling* which is not relevant to
+                                                        // the static mountain backdrop.
+                                                        {
+                                                            const gs = window.GAME_SETTINGS || settings;
+                                                            const mtEnabled = (gs.bgMountains !== false) && (gs.__bgMountainsEffective !== false);
+                                                            if (mtEnabled && typeof renderParallaxMountains === 'function') {
+                                                                renderParallaxMountains(renderer, cam, this.timeOfDay);
+                                                            }
+                                                        }
+
                                                         renderer.renderWorld(this.world, cam, this.timeOfDay);
 
                                                         // 掉落物 / 粒子 / 玩家
